@@ -13,7 +13,7 @@ SCENARIO_CSV_PATH = "scenarios.csv"
 LOG_CSV_PATH = "experiment_log.csv"
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "llama3"  # change to your local model name
+OLLAMA_MODEL = "smollm2:135m"  # change to your local model name
 
 # --------------- DATA MODELS --------------- #
 
