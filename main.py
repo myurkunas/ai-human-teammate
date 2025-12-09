@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import csv
 import json
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 import requests  # pip install requests
+import streamlit as st
 
 # ---------------- CONFIG ---------------- #
 
@@ -244,107 +244,286 @@ def log_round(
         writer.writerow(row)
 
 
-# --------------- EXPERIMENT LOOP --------------- #
+# --------------- STREAMLIT UI --------------- #
 
-def run_experiment():
-    print("=== Human–AI Policy Decision Experiment (Terminal Version) ===\n")
-    participant_id = input("Enter participant ID (or your name/alias): ").strip()
-    if not participant_id:
-        participant_id = "anonymous"
+def init_session_state():
+    """Initialize session state variables"""
+    if "participant_id" not in st.session_state:
+        st.session_state.participant_id = None
+    if "scenarios" not in st.session_state:
+        st.session_state.scenarios = []
+    if "current_round" not in st.session_state:
+        st.session_state.current_round = 0
+    if "team_memory" not in st.session_state:
+        st.session_state.team_memory = TeamMemory()
+    if "total_score" not in st.session_state:
+        st.session_state.total_score = 0
+    if "chat_histories" not in st.session_state:
+        st.session_state.chat_histories = {}  # round_num -> List[Tuple[str, str]]
+    if "decisions" not in st.session_state:
+        st.session_state.decisions = {}  # round_num -> choice
+    if "instructions" not in st.session_state:
+        st.session_state.instructions = {}  # round_num -> instruction_text
+    if "show_outcome" not in st.session_state:
+        st.session_state.show_outcome = {}  # round_num -> bool
+    if "experiment_started" not in st.session_state:
+        st.session_state.experiment_started = False
+    if "experiment_complete" not in st.session_state:
+        st.session_state.experiment_complete = False
 
-    scenarios = load_scenarios(SCENARIO_CSV_PATH)
-    team_memory = TeamMemory()
 
-    print("\nInstructions:")
-    print("- You will see a policy scenario each round.")
-    print("- You get a private memo (stakeholders/politics).")
-    print("- Your AI teammate sees a different private memo (technical data).")
-    print("- You can chat with the AI, then choose a policy option A/B/C/D.")
-    print('- Type "/decide" when you are ready to choose an option.')
-    print('- Type "/quit" at any time to exit.\n')
-    input("Press Enter to begin...")
+def render_welcome_page():
+    """Render the initial welcome/participant ID page"""
+    st.title("🤝 Human–AI Policy Decision Experiment")
+    st.markdown("---")
+    
+    st.markdown("""
+    ### Instructions:
+    - You will see a policy scenario each round.
+    - You get a **private memo** (stakeholders/politics).
+    - Your AI teammate sees a **different private memo** (technical data).
+    - You can chat with the AI, then choose a policy option A/B/C/D.
+    """)
+    
+    participant_id = st.text_input(
+        "Enter participant ID (or your name/alias):",
+        value="",
+        key="participant_input"
+    )
+    
+    if st.button("Start Experiment", type="primary"):
+        if participant_id.strip():
+            st.session_state.participant_id = participant_id.strip()
+        else:
+            st.session_state.participant_id = "anonymous"
+        
+        # Load scenarios
+        try:
+            st.session_state.scenarios = load_scenarios(SCENARIO_CSV_PATH)
+            init_log(LOG_CSV_PATH)
+            st.session_state.experiment_started = True
+            st.session_state.current_round = 0
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error loading scenarios: {e}")
 
-    total_score = 0
-    init_log(LOG_CSV_PATH)
 
-    for scenario in scenarios:
-        print("\n" + "=" * 70)
-        print(f"ROUND {scenario.round_num}: {scenario.title}")
-        print("=" * 70)
-        print("\nYOUR PRIVATE MEMO (Stakeholders/Politics):")
-        print(scenario.human_private_info)
-        print("\nPolicy Options:")
-        print(scenario.options_text)
-        print("\nYou can now chat with your AI teammate.")
-        print('Type messages and press Enter. Type "/decide" to move to decision.\n')
-
-        chat_history: List[Tuple[str, str]] = []
-
-        # Chat loop
-        while True:
-            user_msg = input("You: ").strip()
-            if not user_msg:
-                continue
-            if user_msg.lower() in ("/quit", "/q"):
-                print("\nExiting experiment. Goodbye.")
-                sys.exit(0)
-            if user_msg.lower() in ("/decide", "/d"):
-                break
-
-            chat_history.append(("participant", user_msg))
-            ai_reply = generate_ai_reply(scenario, team_memory, chat_history, user_msg)
+def render_chat_interface(scenario: Scenario):
+    """Render the chat interface for a scenario"""
+    round_key = f"round_{scenario.round_num}"
+    
+    # Initialize chat history for this round
+    if scenario.round_num not in st.session_state.chat_histories:
+        st.session_state.chat_histories[scenario.round_num] = []
+    
+    chat_history = st.session_state.chat_histories[scenario.round_num]
+    
+    st.subheader("💬 Chat with AI Teammate")
+    
+    # Display chat messages
+    chat_container = st.container()
+    with chat_container:
+        for role, message in chat_history:
+            if role == "participant":
+                with st.chat_message("user"):
+                    st.write(message)
+            else:
+                with st.chat_message("assistant"):
+                    st.write(message)
+    
+    # Chat input
+    user_message = st.chat_input("Type your message here...")
+    
+    if user_message:
+        # Add user message to history
+        chat_history.append(("participant", user_message))
+        st.session_state.chat_histories[scenario.round_num] = chat_history
+        
+        # Generate AI reply
+        with st.spinner("AI is thinking..."):
+            ai_reply = generate_ai_reply(
+                scenario,
+                st.session_state.team_memory,
+                chat_history[:-1],  # Exclude the just-added user message
+                user_message
+            )
             chat_history.append(("ai", ai_reply))
-            print(f"AI: {ai_reply}\n")
+            st.session_state.chat_histories[scenario.round_num] = chat_history
+        
+        st.rerun()
 
-        # Decision
-        valid_choices = ["A", "B", "C", "D"]
-        choice = ""
-        while choice not in valid_choices:
-            choice = input("Enter your chosen option (A/B/C/D): ").strip().upper()
-            if choice not in valid_choices:
-                print("Please enter A, B, C, or D.")
 
-        outcome = scenario.outcomes[choice]
-        total_score += outcome.total
+def render_decision_interface(scenario: Scenario):
+    """Render the decision interface"""
+    st.subheader("📋 Make Your Decision")
+    
+    # Parse options text to show buttons
+    options_text = scenario.options_text
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("Option A", key=f"option_A_{scenario.round_num}", use_container_width=True):
+            # Only update if decision hasn't been made yet
+            if scenario.round_num not in st.session_state.decisions:
+                st.session_state.decisions[scenario.round_num] = "A"
+                # Update total score
+                outcome = scenario.outcomes["A"]
+                st.session_state.total_score += outcome.total
+            st.rerun()
+        if st.button("Option C", key=f"option_C_{scenario.round_num}", use_container_width=True):
+            # Only update if decision hasn't been made yet
+            if scenario.round_num not in st.session_state.decisions:
+                st.session_state.decisions[scenario.round_num] = "C"
+                # Update total score
+                outcome = scenario.outcomes["C"]
+                st.session_state.total_score += outcome.total
+            st.rerun()
+    
+    with col2:
+        if st.button("Option B", key=f"option_B_{scenario.round_num}", use_container_width=True):
+            # Only update if decision hasn't been made yet
+            if scenario.round_num not in st.session_state.decisions:
+                st.session_state.decisions[scenario.round_num] = "B"
+                # Update total score
+                outcome = scenario.outcomes["B"]
+                st.session_state.total_score += outcome.total
+            st.rerun()
+        if st.button("Option D", key=f"option_D_{scenario.round_num}", use_container_width=True):
+            # Only update if decision hasn't been made yet
+            if scenario.round_num not in st.session_state.decisions:
+                st.session_state.decisions[scenario.round_num] = "D"
+                # Update total score
+                outcome = scenario.outcomes["D"]
+                st.session_state.total_score += outcome.total
+            st.rerun()
+    
+    # Show options text
+    st.info(f"**Options:** {options_text}")
 
-        print("\n--- Round Outcome ---")
-        print(f"Your choice: {choice}")
-        print(f"Safety impact:    {outcome.safety}")
-        print(f"Equity impact:    {outcome.equity}")
-        print(f"Cost impact:      {outcome.cost}")
-        print(f"Political impact: {outcome.political}")
-        print(f"Round total:      {outcome.total}")
-        print(f"Cumulative total: {total_score}")
 
-        # Adaptation / instruction
-        instruction_text = input(
-            "\nOptional: What would you like your AI teammate to do differently next round?\n"
-            "(Examples: 'be more concise', 'focus more on equity', 'explain more detail')\n"
-            "Press Enter to skip: "
-        ).strip()
-
-        if instruction_text:
-            team_memory = update_team_memory(team_memory, instruction_text)
-
-        # Log everything
+def render_outcome_display(scenario: Scenario, choice: str):
+    """Render the outcome for a completed round"""
+    outcome = scenario.outcomes[choice]
+    
+    st.subheader("📊 Round Outcome")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Safety", outcome.safety)
+    with col2:
+        st.metric("Equity", outcome.equity)
+    with col3:
+        st.metric("Cost", outcome.cost)
+    with col4:
+        st.metric("Political", outcome.political)
+    
+    st.metric("Round Total", outcome.total)
+    st.metric("Cumulative Total", st.session_state.total_score)
+    
+    # Instruction input
+    st.subheader("🔄 Adapt AI Teammate (Optional)")
+    instruction_text = st.text_input(
+        "What would you like your AI teammate to do differently next round?",
+        value=st.session_state.instructions.get(scenario.round_num, ""),
+        key=f"instruction_{scenario.round_num}",
+        placeholder="Examples: 'be more concise', 'focus more on equity', 'explain more detail'"
+    )
+    
+    if instruction_text:
+        st.session_state.instructions[scenario.round_num] = instruction_text
+        st.session_state.team_memory = update_team_memory(
+            st.session_state.team_memory,
+            instruction_text
+        )
+    
+    # Continue button
+    if st.button("Continue to Next Round", type="primary", key=f"continue_{scenario.round_num}"):
+        # Log this round
         log_round(
-            participant_id=participant_id,
+            participant_id=st.session_state.participant_id,
             scenario=scenario,
             choice=choice,
             outcome=outcome,
-            chat_history=chat_history,
-            instruction_text=instruction_text,
+            chat_history=st.session_state.chat_histories.get(scenario.round_num, []),
+            instruction_text=st.session_state.instructions.get(scenario.round_num, ""),
         )
+        
+        # Move to next round
+        st.session_state.current_round += 1
+        if st.session_state.current_round >= len(st.session_state.scenarios):
+            st.session_state.experiment_complete = True
+        st.rerun()
 
-        input("\nPress Enter to continue to the next round...")
 
-    print("\n=== Experiment complete ===")
-    print(f"Final total score: {total_score}")
-    print(f"Data saved to: {LOG_CSV_PATH}")
+def render_scenario_page():
+    """Render the main scenario page"""
+    if not st.session_state.scenarios:
+        st.error("No scenarios loaded. Please restart the experiment.")
+        return
+    
+    if st.session_state.current_round >= len(st.session_state.scenarios):
+        render_completion_page()
+        return
+    
+    scenario = st.session_state.scenarios[st.session_state.current_round]
+    
+    # Header
+    st.title(f"Round {scenario.round_num}: {scenario.title}")
+    
+    # Progress bar
+    progress = (st.session_state.current_round + 1) / len(st.session_state.scenarios)
+    st.progress(progress, text=f"Round {st.session_state.current_round + 1} of {len(st.session_state.scenarios)}")
+    
+    # Private memo
+    with st.expander("📄 Your Private Memo (Stakeholders/Politics)", expanded=True):
+        st.write(scenario.human_private_info)
+    
+    # Check if decision has been made
+    if scenario.round_num in st.session_state.decisions:
+        choice = st.session_state.decisions[scenario.round_num]
+        render_outcome_display(scenario, choice)
+    else:
+        # Show chat and decision interfaces
+        render_chat_interface(scenario)
+        st.markdown("---")
+        render_decision_interface(scenario)
+
+
+def render_completion_page():
+    """Render the experiment completion page"""
+    st.title("🎉 Experiment Complete!")
+    st.balloons()
+    
+    st.metric("Final Total Score", st.session_state.total_score)
+    
+    st.success(f"Data saved to: {LOG_CSV_PATH}")
+    
+    if st.button("Start New Experiment"):
+        # Reset session state
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+
+def main():
+    """Main Streamlit app"""
+    st.set_page_config(
+        page_title="AI-Human Policy Experiment",
+        page_icon="🤝",
+        layout="wide"
+    )
+    
+    init_session_state()
+    
+    if not st.session_state.experiment_started:
+        render_welcome_page()
+    elif st.session_state.experiment_complete:
+        render_completion_page()
+    else:
+        render_scenario_page()
 
 
 if __name__ == "__main__":
-    try:
-        run_experiment()
-    except KeyboardInterrupt:
-        print("\n\nInterrupted by user. Goodbye.")
+    main()
